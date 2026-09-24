@@ -95,7 +95,6 @@ import com.google.android.material.snackbar.Snackbar
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import org.lineageos.aperture.ext.*
 import org.lineageos.aperture.models.AssistantIntent
@@ -131,6 +130,7 @@ import org.lineageos.aperture.ui.LensSelectorLayout
 import org.lineageos.aperture.ui.LevelerView
 import org.lineageos.aperture.ui.LocationPermissionsDialog
 import org.lineageos.aperture.ui.PreviewBlurView
+import org.lineageos.aperture.ui.ZoomSpring
 import org.lineageos.aperture.ui.VerticalSlider
 import org.lineageos.aperture.utils.BroadcastUtils
 import org.lineageos.aperture.utils.CameraSoundsUtils
@@ -236,7 +236,33 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
      */
     private val secureMediaUris = mutableListOf<Uri>()
 
-    private var zoomGestureMutex = Mutex()
+    /**
+     * Spring driving the camera in ratio space, for the lens pills and the zoom
+     * in/out shortcuts. The starting value is a placeholder: both callers
+     * resync from the live zoom state before the first move, which also keeps
+     * this initialiser from touching [cameraController] before it exists.
+     */
+    private val zoomRatioSpring by lazy {
+        ZoomSpring(1f) { cameraController.setZoomRatio(it) }
+    }
+
+    /**
+     * Spring driving the camera in linear zoom space, the same space the zoom
+     * bar reports in. Kept apart from the ratio spring because the two spaces
+     * cannot be blended into one another, so only one may own the camera.
+     */
+    private val linearZoomSpring by lazy {
+        ZoomSpring(0f) { cameraController.setLinearZoom(it) }
+    }
+
+    /**
+     * Stop any zoom spring in flight, leaving the camera where it had got to
+     * so the next interaction continues from what is on screen.
+     */
+    private fun cancelZoomAnimations() {
+        zoomRatioSpring.cancel()
+        linearZoomSpring.cancel()
+    }
 
     private val supportedFlashModes: Set<FlashMode>
         get() = cameraMode.supportedFlashModes.intersect(camera.supportedFlashModes)
@@ -293,6 +319,8 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
             when (it) {
                 is ZoomGestureDetector.ZoomEvent.Begin -> {
                     zoomGestureDetectorIsInProgress = true
+                    // Fingers take precedence over a bar animation in flight.
+                    cancelZoomAnimations()
                 }
 
                 is ZoomGestureDetector.ZoomEvent.Move -> {
@@ -771,7 +799,13 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         }
 
         zoomLevel.onProgressChangedByUser = {
+            // Direct control wins over a running animation, otherwise the two
+            // would fight over the same value every frame.
+            cancelZoomAnimations()
             cameraController.setLinearZoom(it)
+        }
+        zoomLevel.onTappedAt = {
+            smoothSetLinearZoom(it)
         }
         zoomLevel.textFormatter = {
             "%.1fx".format(cameraController.zoomState.value?.zoomRatio)
@@ -1165,6 +1199,9 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     }
 
     override fun onPause() {
+        // Cancel pending zoom callbacks before the activity pauses
+        cancelZoomAnimations()
+
         // Remove location and location updates
         locationListener.unregister()
 
@@ -2383,29 +2420,53 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     /**
      * Apply the specified zoom smoothly. The value will be automatically clamped
      * between min and max.
+     *
+     * Retargeting while a previous move is still running keeps that move's
+     * velocity, so changing your mind halfway reads as one continuous motion
+     * rather than two separate ones.
+     *
      * @param zoomRatio The zoom ratio to apply
      */
     private fun smoothZoom(zoomRatio: Float) {
-        val acquired = zoomGestureMutex.tryLock()
-        if (!acquired) {
-            return
+        val zoomState = cameraController.zoomState.value ?: return
+        val target = zoomRatio.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
+        val spring = zoomRatioSpring
+
+        // If the camera is somewhere the spring does not know about, because a
+        // pinch or a drag moved it, resync before aiming. Only when idle: a
+        // spring that is already moving is the authority on where it is.
+        if (!spring.isActive()) {
+            spring.resetTo(zoomState.zoomRatio)
         }
 
-        val zoomState = cameraController.zoomState.value ?: return
+        linearZoomSpring.cancel()
+        spring.stiffness = ZoomSpring.STIFFNESS_SETTLE
+        spring.setTarget(target)
+    }
 
-        ValueAnimator.ofFloat(
-            zoomState.zoomRatio,
-            zoomRatio.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
-        ).apply {
-            addUpdateListener {
-                cameraController.setZoomRatio(it.animatedValue as Float)
-            }
-            addListener(
-                onEnd = {
-                    zoomGestureMutex.unlock()
-                }
-            )
-        }.start()
+    /**
+     * Ease bar taps towards [targetLinearZoom] rather than jumping to them.
+     *
+     * The travel happens in linear zoom, the space the bar reports in, so taps
+     * and drags act on the same scale. The thumb is positioned from the
+     * observed zoom state, so it follows whichever spring is driving.
+     *
+     * @param targetLinearZoom The linear zoom to settle on
+     */
+    private fun smoothSetLinearZoom(targetLinearZoom: Float) {
+        val zoomState = cameraController.zoomState.value ?: return
+        // CameraX normalises linear zoom to 0..1 across the device's ratio
+        // range, and ZoomState does not expose those bounds directly.
+        val target = targetLinearZoom.coerceIn(0f, 1f)
+        val spring = linearZoomSpring
+
+        if (!spring.isActive()) {
+            spring.resetTo(zoomState.linearZoom)
+        }
+
+        zoomRatioSpring.cancel()
+        spring.stiffness = ZoomSpring.STIFFNESS_SETTLE
+        spring.setTarget(target)
     }
 
     /**
